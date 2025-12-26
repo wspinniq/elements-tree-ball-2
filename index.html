@@ -1044,6 +1044,166 @@ function layoutFromPreset(preset, atomSize, region){
     return {atoms, bonds};
 }
 
+// ---- Auto-shrink / auto-scale to prevent atom overlap (especially for large formulas/presets) ----
+function __minCenterDistance(points, atomSize){
+    // points: [{x,y}] top-left positions
+    if(!points || points.length < 2) return Infinity;
+    const centers = points.map(p => ({cx: p.x + atomSize/2, cy: p.y + atomSize/2}));
+    let minD = Infinity;
+    for(let i=0;i<centers.length;i++){
+        for(let j=i+1;j<centers.length;j++){
+            const dx = centers[i].cx - centers[j].cx;
+            const dy = centers[i].cy - centers[j].cy;
+            const d = Math.hypot(dx,dy);
+            if(d < minD) minD = d;
+        }
+    }
+    return minD;
+}
+function __clampPoints(points, atomSize, bounds){
+    const {left, right, top, bottom} = bounds; // bottom is maxYTop
+    return points.map(p => ({
+        x: Math.min(Math.max(p.x, left), right - atomSize),
+        y: Math.min(Math.max(p.y, top), bottom)
+    }));
+}
+
+function __resolveOverlaps(points, atomSize, bounds){
+    // Simple relaxation: push circles apart if they overlap.
+    // points: [{x,y}] top-left; treated as circles with radius atomSize/2 around center.
+    const {left, right, top, bottom} = bounds;
+    const r = atomSize / 2;
+    const minD = atomSize * 1.04; // desired center distance
+    const centers = points.map(p => ({cx: p.x + r, cy: p.y + r}));
+
+    for(let iter=0; iter<90; iter++){
+        let moved = 0;
+        for(let i=0;i<centers.length;i++){
+            for(let j=i+1;j<centers.length;j++){
+                let dx = centers[i].cx - centers[j].cx;
+                let dy = centers[i].cy - centers[j].cy;
+                let d = Math.hypot(dx,dy);
+
+                if(d < 0.001){
+                    // same spot - random nudge
+                    dx = (Math.random()*2-1) * 0.5;
+                    dy = (Math.random()*2-1) * 0.5;
+                    d = Math.hypot(dx,dy);
+                }
+                if(d < minD){
+                    const overlap = (minD - d) / 2;
+                    const ux = dx / d;
+                    const uy = dy / d;
+                    centers[i].cx += ux * overlap;
+                    centers[i].cy += uy * overlap;
+                    centers[j].cx -= ux * overlap;
+                    centers[j].cy -= uy * overlap;
+                    moved++;
+                }
+            }
+        }
+
+        // clamp to bounds each iter
+        for(const c of centers){
+            c.cx = Math.min(Math.max(c.cx, left + r), right - r);
+            c.cy = Math.min(Math.max(c.cy, top + r), bottom - r); // bottom is maxYTop, so add r allowance
+        }
+
+        if(moved === 0) break;
+    }
+    return centers.map(c => ({
+        x: c.cx - r,
+        y: c.cy - r
+    }));
+}
+function __forceDistribute(points, atomSize, bounds){
+    // Force-directed spreading to use more space and eliminate residual overlaps.
+    const {left, right, top, bottom} = bounds;
+    const r = atomSize/2;
+    const minD = atomSize * 1.08;
+
+    let nodes = points.map(p => ({
+        x: p.x + r,
+        y: p.y + r,
+        vx: 0,
+        vy: 0
+    }));
+
+    const cx = (left + right) / 2;
+    const cy = (top + bottom) / 2;
+
+    for(let iter=0; iter<520; iter++){
+        // pairwise repulsion when too close
+        for(let i=0;i<nodes.length;i++){
+            for(let j=i+1;j<nodes.length;j++){
+                let dx = nodes[i].x - nodes[j].x;
+                let dy = nodes[i].y - nodes[j].y;
+                let d = Math.hypot(dx,dy) || 0.001;
+                if(d < minD){
+                    const push = (minD - d) * 0.10;
+                    dx /= d; dy /= d;
+                    nodes[i].vx += dx * push;
+                    nodes[i].vy += dy * push;
+                    nodes[j].vx -= dx * push;
+                    nodes[j].vy -= dy * push;
+                }
+            }
+        }
+
+        // soft centering so it doesn't explode outwards
+        for(const n of nodes){
+            n.vx += (cx - n.x) * 0.00045;
+            n.vy += (cy - n.y) * 0.00045;
+        }
+
+        // integrate with damping + clamp
+        for(const n of nodes){
+            n.x += n.vx;
+            n.y += n.vy;
+            n.vx *= 0.80;
+            n.vy *= 0.80;
+
+            n.x = Math.min(Math.max(n.x, left + r), right - r);
+            n.y = Math.min(Math.max(n.y, top + r), bottom - r);
+        }
+    }
+
+    return nodes.map(n => ({ x: n.x - r, y: n.y - r }));
+}
+
+
+function __fitPresetNoOverlap(preset, startAtomSize, region, bounds, minAtomSize){
+    // Iteratively shrink atom size until min center distance is large enough.
+    // This is robust for dense presets (e.g., glucose/sucrose when showing explicit H).
+    let s = startAtomSize;
+    const safety = 1.04; // center distance should be >= atomSize * safety
+    for(let iter=0; iter<10; iter++){
+        const laid = layoutFromPreset(preset, s, region);
+        let pts = __clampPoints(laid.atoms.map(p=>({x:p.x,y:p.y})), s, bounds);
+        // 先做一次排斥鬆弛，把太靠近的球推開(比單純縮小更有效)
+        pts = __resolveOverlaps(pts, s, bounds);
+        pts = __forceDistribute(pts, s, bounds);
+        pts = __resolveOverlaps(pts, s, bounds);
+        const minD = __minCenterDistance(pts, s);
+
+        if(minD >= s * safety) {
+            return { atomSize: s, points: pts, bonds: laid.bonds };
+        }
+        // shrink a bit and retry
+        const next = Math.max(minAtomSize, Math.floor(s * 0.92));
+        if(next === s) break;
+        s = next;
+    }
+    // fallback: return last layout (best effort)
+    const laid = layoutFromPreset(preset, s, region);
+    let pts = __clampPoints(laid.atoms.map(p=>({x:p.x,y:p.y})), s, bounds);
+    pts = __resolveOverlaps(pts, s, bounds);
+    pts = __forceDistribute(pts, s, bounds);
+    pts = __resolveOverlaps(pts, s, bounds);
+    return { atomSize: s, points: pts, bonds: laid.bonds };
+}
+
+
 // SVG bond rendering that follows floating atoms (updates each frame)
 let __bondRAF = null;
 function stopBondRAF(){
@@ -1242,14 +1402,14 @@ function play() {
         cell = Math.min(regionW / cols, regionH / rows);
 
         // autoshrink (min 28px)
-        finalAtomSize = Math.max(28, Math.min(baseAtomSize, cell * 0.88));
+        finalAtomSize = Math.max(18, Math.min(baseAtomSize, cell * 0.88));
     }
     // recompute with final size
     maxYTop = Math.max(regionTop, Math.min(infoRect.top - finalAtomSize - margin, vh - finalAtomSize - margin));
     const regionH = Math.max(10, (maxYTop + finalAtomSize) - regionTop);
     cell = Math.min(regionW / cols, regionH / rows);
 
-    const fontSize = Math.max(12, finalAtomSize * 0.42);
+    let fontSize = Math.max(12, finalAtomSize * 0.42);
 
     // launch origin: near center but above info area
     const startX = vw * 0.50 - finalAtomSize / 2;
@@ -1273,15 +1433,48 @@ function play() {
     let bondList = [];
 
     if (preset && preset.atoms && preset.atoms.length === atomCount) {
-        const laid = layoutFromPreset(preset, finalAtomSize, region);
+        // 針對「元素球很多」的分子(如 C₆H₁₂O₆ / C₁₂H₂₂O₁₁)：
+        // 先用 preset 佈局，再自動縮小球/字，直到不會互相重疊
+        // 針對「元素球很多」的分子：使用更大的可用範圍 + 力場分散，並在必要時再縮小重試
+        const regionW = (regionRight - regionLeft);
+        const regionH = (maxYTop - regionTop);
+        const density = (atomCount * finalAtomSize * finalAtomSize) / Math.max(1, (regionW * regionH));
 
-        // Clamp preset atoms into our allowed region
-        targetList = laid.atoms.map(p => {
-            const x = Math.min(Math.max(p.x, regionLeft), regionRight - finalAtomSize);
-            const y = Math.min(Math.max(p.y, regionTop), maxYTop);
-            return { x, y };
-        });
-        bondList = laid.bonds;
+        // 空間很擠時，把可用範圍擴到更寬(幾乎整個畫面)，讓球有地方散開
+        const wideBounds = density > 0.34;
+        const marginX = Math.max(12, vw * 0.06);
+        const marginY = 8;
+
+        const boundsUsed = wideBounds
+            ? { left: marginX, right: vw - marginX, top: regionTop + marginY, bottom: maxYTop }
+            : { left: regionLeft, right: regionRight, top: regionTop, bottom: maxYTop };
+
+        let attemptSize = finalAtomSize;
+        let fitted = null;
+
+        for(let tries=0; tries<8; tries++){
+            fitted = __fitPresetNoOverlap(
+                preset,
+                attemptSize,
+                region,
+                boundsUsed,
+                18
+            );
+
+            // 檢查是否仍有碰撞/重疊
+            const minD = __minCenterDistance(fitted.points, fitted.atomSize);
+            if(minD >= fitted.atomSize * 1.02) break;
+
+            // 仍太擠 -> 再縮小一點重試
+            const next = Math.max(18, Math.floor(attemptSize * 0.90));
+            if(next === attemptSize) break;
+            attemptSize = next;
+        }
+
+        // 用最佳尺寸覆蓋(避免 preset 彼此覆蓋)
+        finalAtomSize = fitted.atomSize;
+        targetList = fitted.points;
+        bondList = fitted.bonds;
     }
 
     // If no preset (or mismatch), use grid fallback
@@ -1295,8 +1488,12 @@ function play() {
 
             // subtle jitter
             const jitter = Math.min(6, Math.max(0, (cell - finalAtomSize) / 4));
-            x += (Math.random() * 2 - 1) * jitter;
-            y += (Math.random() * 2 - 1) * jitter;
+
+            // 如果空間很緊(球快貼到 cell 邊界)，就把 jitter 幾乎關掉避免重疊
+            const tight = (cell - finalAtomSize) < (finalAtomSize * 0.18);
+            const j = tight ? jitter * 0.15 : jitter;
+            x += (Math.random() * 2 - 1) * j;
+            y += (Math.random() * 2 - 1) * j;
 
             // clamp
             x = Math.min(Math.max(x, regionLeft), regionRight - finalAtomSize);
@@ -1307,6 +1504,9 @@ function play() {
         // naive bonds for fallback: connect sequentially (visual only)
         bondList = atomList.length >= 2 ? atomList.slice(1).map((_, i) => ({ a: i, b: i+1, type: "single" })) : [];
     }
+
+    // 若 preset 自動縮小了球體尺寸，這裡同步更新字體大小
+    fontSize = Math.max(11, finalAtomSize * 0.42);
 
     const createdAtoms = [];
 
